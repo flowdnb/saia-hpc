@@ -41,7 +41,7 @@ then
             echo "$current_time" > .last_update
             ./scheduler.py check_routine
             sleep 2
-            ./scheduler.py health_check
+            ./health_check.py
         fi
     fi
     exit

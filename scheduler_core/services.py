@@ -102,6 +102,7 @@ class Service:
         self.job_expiry_time = None
         self.input = []
         self.output = []
+        self.health_check_script: str | None = None
 
     def calculate_active_service_jobs(self):
         active_jobs = 0
@@ -164,6 +165,7 @@ class Service:
         self.average_inferences = data['average_inferences']
         self.input = data['input']
         self.output = data['output']
+        self.health_check_script = data.get('health_check_script', None)
         self.created_time = data['created_time']
         self.owned_by = data['owned_by']
         for service_job_data in data['service_jobs']:
@@ -192,8 +194,19 @@ class ServiceList:
         # Write service files for cloud_interface
         if update_services:
             for s in self.services:
+                ready = [j for j in s.service_jobs if j.ready and j.host]
+                # if more than one ready job, filter out any that's about to expire
+                if len(ready) > 1:
+                    filtered = [j for j in ready if not j.is_about_to_expire()]
+                    # if filtering would drop all of them, fall back to all ready
+                    backends = filtered or ready
+                else:
+                    backends = ready
+
                 with open(os.path.join(service_dir, f"{s.id}.service"), "w") as f:
-                    f.write('BACKENDS=(' + ' '.join([f'"{j.host}:{j.port}"' for j in s.service_jobs if j.ready and j.host is not None]) + ')')
+                    f.write('BACKENDS=(' +
+                            ' '.join(f'"{j.host}:{j.port}"' for j in backends) +
+                            ')')
 
     def update_service_job_from_queue(self, squeue_output):
         for line in squeue_output:

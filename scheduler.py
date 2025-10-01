@@ -32,6 +32,7 @@ sbatch_path = '/usr/local/slurm/current/install/bin/sbatch'
 scancel_path = '/usr/local/slurm/current/install/bin/scancel'
 EXPIRE_LIMIT = "9:30"
 FILE_LOCK = ".scheduler.lock"
+FILE_LOCK_HEALTH = ".scheduler.health.lock"
 MIN_PORT = 61001
 MAX_PORT = 62000
 ROUTINE_INTERVAL = 5     # Period of check_routine
@@ -157,17 +158,48 @@ def acquire_lock():
         #os.remove(FILE_LOCK)
         #return acquire_lock()
 
+def acquire_lock_health():
+    # Set a lock file with the current process id, to serve as a mutex across multiple processes
+    try:
+        # Create the file (O_CREAT), fail if it exists (O_EXCL), open in read write mode (O_RDWR)
+        fd = os.open(FILE_LOCK_HEALTH, os.O_CREAT | os.O_EXCL | os.O_RDWR)
+        os.write(fd, str.encode(str(os.getpid())))
+        os.close(fd)
+        logging.debug('Set lock for routine scheduling check.')
+        return True
+    except OSError:
+        #with open(FILE_LOCK) as f:
+        #    line = f.readline().strip()
+        #    if len(line) == 0:
+        #        return False
+        #    pid = int(f.readline().strip())
+        #if is_running(pid):
+        logging.warning('Previous routine check is still running.')
+        return False
+        #logging.info('Previous routine check is not running, resetting lock.')
+        #os.remove(FILE_LOCK)
+        #return acquire_lock()
+
 
 def release_lock():
     # Attempt to release the lock
     try:
         os.remove(FILE_LOCK)
-        logging.debug('Released lock.')
+        logging.debug('Released routine lock.')
         return True
-    except OSError:
-        logging.error('Could not release lock.')
+    except OSError as e:
+        logging.error('Could not release routine lock: ' + str(e))
         return False
 
+def release_lock_health():
+    # Attempt to release the lock
+    try:
+        os.remove(FILE_LOCK_HEALTH)
+        logging.debug('Released health lock.')
+        return True
+    except OSError as e:
+        logging.error('Could not release health lock: ' + str(e))
+        return False
 
 def main():
     logging.basicConfig(filename=log_filepath, level=logging.INFO,
@@ -317,10 +349,8 @@ def check_routine(service_id="", scale_to_zero=False):
                 if unready_job.ready == False:
                     job_start_time = datetime.strptime(unready_job.job_start_time, TIME_FORMAT)
                     job_ready_time_limit = squeue_time_to_timedelta(unready_job.job_expiry_time) * 1.5
-                    print(job_ready_time_limit)
-                    print(job_start_time)
                     if datetime.now() - job_start_time > job_ready_time_limit:
-                        logging.warning(f'Job {unready_job.jobid} exceeded ready time limit and will be marked as failed.')
+                        logging.warning(f'Job {unready_job.jobid} exceeded ready time limit {job_ready_time_limit} and will be marked as failed.')
                         cancel_job(unready_job.jobid)
                         unready_job.job_ready_time = datetime.now().strftime(TIME_FORMAT)
 
@@ -384,9 +414,10 @@ def health_check():
 
     # Try to acquire the lock to ensure no other instance is running
     lock_acquired = False
+    lock_acquired_health = False
     try:
         if not acquire_lock():
-            logging.warning("Another health check process is running. Exiting.")
+            logging.warning("Routine process is running. Exiting.")
             return
         lock_acquired = True
 
@@ -399,21 +430,52 @@ def health_check():
         squeue_output = get_squeue_status()
         service_list.update_service_job_from_queue(squeue_output)
 
+        # Release routine lock, as health check can take some time
+        release_lock()
+        lock_acquired = False     
+
+        # Lock health check to avoid duplicates
+        if not acquire_lock_health():
+            logging.warning("Another health check process is running. Exiting.")
+            return
+        lock_acquired_health = True
+        logging.debug("Health check process starting...")
+
         # Iterate through all services and their jobs
         for service in service_list.services:
             for service_job in service.service_jobs:
                 if service_job.ready and service_job.host and not service_job.is_about_to_expire():
                     # Check the health of the service job
                     logging.debug(f'Checking health for ready job {service_job.jobid} on {service_job.host}:{service_job.port}')
-                    if check_service_job_status(service_job.host, service_job.port):
+                    healthy = False
+                    if service.health_check_script:
+                        # custom script should exit 0 when healthy
+                        try:
+                            res = subprocess.run(
+                                [service.health_check_script, f"{service_job.host}:{service_job.port}", f"{service.id}"],
+                                capture_output=True, text=True, timeout=180
+                            )
+                            healthy = (res.returncode == 0)
+                            logging.debug(f"Job {service.id} on {service_job.host}:{service_job.port} health is {healthy}")
+                        except subprocess.TimeoutExpired as e:
+                            logging.error(f"Health check for {service.id} failed due to timeout: {e}")
+                            healthy = False  # explicitly mark as unhealthy
+                        except Exception as e:
+                            logging.info(f"Error during custom health check for {str(e)}, falling back to standard health check")
+                            healthy = check_service_job_status(service_job.host, service_job.port)
+                    else:
+                        # fallback to built-in curl probe
+                        healthy = check_service_job_status(service_job.host, service_job.port)
+
+                    if healthy:
                         logging.debug(f'Job {service_job.jobid} on {service_job.host}:{service_job.port} is healthy.')
                     else:
-                        logging.warning(f'Job {service_job.jobid} on {service_job.host}:{service_job.port} is unhealthy. Cancelling.')
+                        logging.error(f'Job {service_job.jobid} on {service_job.host}:{service_job.port} is unhealthy. Cancelling.')
                         cancel_job(service_job.jobid)
                 
 
         # Save updated service list back to the file
-        service_list.save_to_file()
+        # service_list.save_to_file()
         logging.debug('Health check completed.')
 
     except Exception as e:
@@ -422,6 +484,8 @@ def health_check():
     finally:
         if lock_acquired:
             release_lock()
+        if lock_acquired_health:
+            release_lock_health()
 
 
 def begin_inference(inference_id, user, app):
@@ -457,6 +521,7 @@ def init():
         new_service.maximum_number_instances = service["maximum_number_instances"]
         new_service.minimum_number_instances = service["minimum_number_instances"]
         new_service.job_expiry_time = service["job_expiry_time"]
+        new_service.health_check_script = service.get("health_check_script", None)
         new_service.number_required_jobs = 0
         new_service.target_number_instances = 0
         new_service.owned_by = service["owned_by"]
